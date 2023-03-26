@@ -515,13 +515,15 @@ impl<'t> TextEdit<'t> {
         } else {
             clip_text_lines[min_row..text_row].join("\n")
         };
-        println!("ROW: {}, {}", max_row, text_row);
-        println!("NEW {}", new_text);
-        //text.replace(new_text.as_str());
-        let mut show_galley = layouter(ui, new_text.as_str(), wrap_width);
 
-        //let mut galley = layouter(ui, new_text.as_str(), wrap_width);
-        let mut galley = layouter(ui, text.as_str(), wrap_width);
+        //println!("ROW: {}, {}, {}", min_row, max_row, text_row);
+        //println!("NEW {}", new_text);
+
+        //text.replace(new_text.as_str());
+        //let mut show_galley = layouter(ui, new_text.as_str(), wrap_width);
+
+        let mut galley = layouter(ui, new_text.as_str(), wrap_width);
+        //let mut galley = layouter(ui, text.as_str(), wrap_width);
 
         let desired_width = if clip_text {
             wrap_width // visual clipping with scroll in singleline input.
@@ -708,8 +710,8 @@ impl<'t> TextEdit<'t> {
         };
 
         if ui.is_rect_visible(rect) {
-            //painter.galley(text_draw_pos, galley.clone());
-            painter.galley(text_draw_pos, show_galley.clone());
+            painter.galley(text_draw_pos, galley.clone());
+            //painter.galley(text_draw_pos, show_galley.clone());
 
             if text.as_str().is_empty() && !hint_text.is_empty() {
                 let hint_text_color = ui.visuals().weak_text_color();
@@ -1427,6 +1429,7 @@ fn events(
                 // Newlines are handled by `Key::Enter`.
                 if !text_to_insert.is_empty() && text_to_insert != "\n" && text_to_insert != "\r" {
                     let mut ccursor = delete_selected(text, &cursor_range);
+                    println!("Insert: {}", text_to_insert);
                     insert_text(&mut ccursor, text, text_to_insert);
                     Some(CCursorRange::one(ccursor))
                 } else {
