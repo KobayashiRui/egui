@@ -504,7 +504,7 @@ impl<'t> TextEdit<'t> {
 
         let layouter = layouter.unwrap_or(&mut default_layouter);
 
-        let binding = text.take();
+        let binding = text.as_str().to_string();
         let mut clip_text_lines: Vec<&str> = binding.lines().collect();
         clip_text_lines.push("");
         let mut text_row = clip_text_lines.len();
@@ -517,10 +517,11 @@ impl<'t> TextEdit<'t> {
         };
         println!("ROW: {}, {}", max_row, text_row);
         println!("NEW {}", new_text);
-        text.replace(new_text.as_str());
+        //text.replace(new_text.as_str());
+        let mut show_galley = layouter(ui, new_text.as_str(), wrap_width);
 
-        let mut galley = layouter(ui, text.as_str(), wrap_width);
         //let mut galley = layouter(ui, new_text.as_str(), wrap_width);
+        let mut galley = layouter(ui, text.as_str(), wrap_width);
 
         let desired_width = if clip_text {
             wrap_width // visual clipping with scroll in singleline input.
@@ -707,7 +708,8 @@ impl<'t> TextEdit<'t> {
         };
 
         if ui.is_rect_visible(rect) {
-            painter.galley(text_draw_pos, galley.clone());
+            //painter.galley(text_draw_pos, galley.clone());
+            painter.galley(text_draw_pos, show_galley.clone());
 
             if text.as_str().is_empty() && !hint_text.is_empty() {
                 let hint_text_color = ui.visuals().weak_text_color();
