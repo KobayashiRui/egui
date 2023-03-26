@@ -570,6 +570,40 @@ impl ScrollArea {
         })
     }
 
+    pub fn show_textedit<R>(
+        self,
+        ui: &mut Ui,
+        row_height_sans_spacing: f32,
+        total_rows: usize,
+        add_contents: impl FnOnce(&mut Ui, usize, usize) -> R,
+    ) -> ScrollAreaOutput<R> {
+        let spacing = ui.spacing().item_spacing;
+        let row_height_with_spacing = row_height_sans_spacing + spacing.y;
+        self.show_viewport(ui, |ui, viewport| {
+            ui.set_height((row_height_with_spacing * total_rows as f32 - spacing.y).at_least(0.0));
+
+            let mut min_row = (viewport.min.y / row_height_with_spacing).floor() as usize;
+            let mut max_row = (viewport.max.y / row_height_with_spacing).ceil() as usize + 1;
+            if max_row > total_rows {
+                let diff = max_row.saturating_sub(min_row);
+                max_row = total_rows;
+                min_row = total_rows.saturating_sub(diff);
+            }
+
+            let y_min = ui.max_rect().top() + min_row as f32 * row_height_with_spacing;
+            let y_max = ui.max_rect().top() + max_row as f32 * row_height_with_spacing;
+
+            let rect = Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
+
+            ui.allocate_ui_at_rect(rect, |viewport_ui| {
+                viewport_ui.skip_ahead_auto_ids(min_row); // Make sure we get consistent IDs.
+                                                          //add_contents(viewport_ui, min_row..max_row)
+                add_contents(viewport_ui, min_row, max_row)
+            })
+            .inner
+        })
+    }
+
     /// This can be used to only paint the visible part of the contents.
     ///
     /// `add_contents` is given the viewport rectangle, which is the relative view of the content.

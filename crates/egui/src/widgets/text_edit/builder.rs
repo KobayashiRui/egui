@@ -391,6 +391,509 @@ impl<'t> TextEdit<'t> {
         output
     }
 
+    pub fn show_range(self, ui: &mut Ui, min_row: usize, max_row: usize) -> TextEditOutput {
+        let is_mutable = self.text.is_mutable();
+        let frame = self.frame;
+        let interactive = self.interactive;
+        let where_to_put_background = ui.painter().add(Shape::Noop);
+
+        let margin = self.margin;
+        let max_rect = ui.available_rect_before_wrap().shrink2(margin);
+        let mut content_ui = ui.child_ui(max_rect, *ui.layout());
+        //let mut output = self.show_content(&mut content_ui);
+        let mut output = self.show_content_range(&mut content_ui, min_row, max_row);
+        let id = output.response.id;
+        let frame_rect = output.response.rect.expand2(margin);
+        ui.allocate_space(frame_rect.size());
+        if interactive {
+            output.response |= ui.interact(frame_rect, id, Sense::click());
+        }
+        if output.response.clicked() && !output.response.lost_focus() {
+            ui.memory_mut(|mem| mem.request_focus(output.response.id));
+        }
+
+        if frame {
+            let visuals = ui.style().interact(&output.response);
+            let frame_rect = frame_rect.expand(visuals.expansion);
+            let shape = if is_mutable {
+                if output.response.has_focus() {
+                    epaint::RectShape {
+                        rect: frame_rect,
+                        rounding: visuals.rounding,
+                        // fill: ui.visuals().selection.bg_fill,
+                        fill: ui.visuals().extreme_bg_color,
+                        stroke: ui.visuals().selection.stroke,
+                    }
+                } else {
+                    epaint::RectShape {
+                        rect: frame_rect,
+                        rounding: visuals.rounding,
+                        fill: ui.visuals().extreme_bg_color,
+                        stroke: visuals.bg_stroke, // TODO(emilk): we want to show something here, or a text-edit field doesn't "pop".
+                    }
+                }
+            } else {
+                let visuals = &ui.style().visuals.widgets.inactive;
+                epaint::RectShape {
+                    rect: frame_rect,
+                    rounding: visuals.rounding,
+                    // fill: ui.visuals().extreme_bg_color,
+                    // fill: visuals.bg_fill,
+                    fill: Color32::TRANSPARENT,
+                    stroke: visuals.bg_stroke, // TODO(emilk): we want to show something here, or a text-edit field doesn't "pop".
+                }
+            };
+
+            ui.painter().set(where_to_put_background, shape);
+        }
+
+        output
+    }
+
+    fn show_content_range(self, ui: &mut Ui, min_row: usize, max_row: usize) -> TextEditOutput {
+        let TextEdit {
+            text,
+            hint_text,
+            id,
+            id_source,
+            font_selection,
+            text_color,
+            layouter,
+            password,
+            frame: _,
+            margin,
+            multiline,
+            interactive,
+            desired_width,
+            desired_height_rows,
+            lock_focus,
+            cursor_at_end,
+            min_size,
+            align,
+            clip_text,
+        } = self;
+
+        let text_color = text_color
+            .or(ui.visuals().override_text_color)
+            // .unwrap_or_else(|| ui.style().interact(&response).text_color()); // too bright
+            .unwrap_or_else(|| ui.visuals().widgets.inactive.text_color());
+
+        let prev_text = text.as_str().to_owned();
+
+        let font_id = font_selection.resolve(ui.style());
+        let row_height = ui.fonts(|f| f.row_height(&font_id));
+        const MIN_WIDTH: f32 = 24.0; // Never make a [`TextEdit`] more narrow than this.
+        let available_width = ui.available_width().at_least(MIN_WIDTH);
+        let desired_width = desired_width.unwrap_or_else(|| ui.spacing().text_edit_width);
+        let wrap_width = if ui.layout().horizontal_justify() {
+            available_width
+        } else {
+            desired_width.min(available_width)
+        } - margin.x * 2.0;
+
+        let font_id_clone = font_id.clone();
+        let mut default_layouter = move |ui: &Ui, text: &str, wrap_width: f32| {
+            let text = mask_if_password(password, text);
+            let layout_job = if multiline {
+                LayoutJob::simple(text, font_id_clone.clone(), text_color, wrap_width)
+            } else {
+                LayoutJob::simple_singleline(text, font_id_clone.clone(), text_color)
+            };
+            ui.fonts(|f| f.layout_job(layout_job))
+        };
+
+        let layouter = layouter.unwrap_or(&mut default_layouter);
+
+        let binding = text.take();
+        let mut clip_text_lines: Vec<&str> = binding.lines().collect();
+        clip_text_lines.push("");
+        let mut text_row = clip_text_lines.len();
+        let new_text = if text_row == 0 {
+            "".to_string()
+        } else if max_row < text_row {
+            clip_text_lines[min_row..max_row].join("\n")
+        } else {
+            clip_text_lines[min_row..text_row].join("\n")
+        };
+        println!("ROW: {}, {}", max_row, text_row);
+        println!("NEW {}", new_text);
+        text.replace(new_text.as_str());
+
+        let mut galley = layouter(ui, text.as_str(), wrap_width);
+        //let mut galley = layouter(ui, new_text.as_str(), wrap_width);
+
+        let desired_width = if clip_text {
+            wrap_width // visual clipping with scroll in singleline input.
+        } else {
+            galley.size().x.max(wrap_width)
+        };
+        let desired_height = (desired_height_rows.at_least(1) as f32) * row_height;
+        let desired_size = vec2(desired_width, galley.size().y.max(desired_height))
+            .at_least(min_size - margin * 2.0);
+
+        let (auto_id, rect) = ui.allocate_space(desired_size);
+
+        let id = id.unwrap_or_else(|| {
+            if let Some(id_source) = id_source {
+                ui.make_persistent_id(id_source)
+            } else {
+                auto_id // Since we are only storing the cursor a persistent Id is not super important
+            }
+        });
+        let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
+
+        // On touch screens (e.g. mobile in `eframe` web), should
+        // dragging select text, or scroll the enclosing [`ScrollArea`] (if any)?
+        // Since currently copying selected text in not supported on `eframe` web,
+        // we prioritize touch-scrolling:
+        let allow_drag_to_select =
+            ui.input(|i| !i.any_touches()) || ui.memory(|mem| mem.has_focus(id));
+
+        let sense = if interactive {
+            if allow_drag_to_select {
+                Sense::click_and_drag()
+            } else {
+                Sense::click()
+            }
+        } else {
+            Sense::hover()
+        };
+        let mut response = ui.interact(rect, id, sense);
+        let text_clip_rect = rect;
+        let painter = ui.painter_at(text_clip_rect.expand(1.0)); // expand to avoid clipping cursor
+
+        if interactive {
+            if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
+                if response.hovered() && text.is_mutable() {
+                    ui.output_mut(|o| o.mutable_text_under_cursor = true);
+                }
+
+                // TODO(emilk): drag selected text to either move or clone (ctrl on windows, alt on mac)
+                let singleline_offset = vec2(state.singleline_offset, 0.0);
+                let cursor_at_pointer =
+                    galley.cursor_from_pos(pointer_pos - response.rect.min + singleline_offset);
+
+                if ui.visuals().text_cursor_preview
+                    && response.hovered()
+                    && ui.input(|i| i.pointer.is_moving())
+                {
+                    // preview:
+                    paint_cursor_end(
+                        ui,
+                        row_height,
+                        &painter,
+                        response.rect.min,
+                        &galley,
+                        &cursor_at_pointer,
+                    );
+                }
+
+                if response.double_clicked() {
+                    // Select word:
+                    let center = cursor_at_pointer;
+                    let ccursor_range = select_word_at(text.as_str(), center.ccursor);
+                    state.set_cursor_range(Some(CursorRange {
+                        primary: galley.from_ccursor(ccursor_range.primary),
+                        secondary: galley.from_ccursor(ccursor_range.secondary),
+                    }));
+                } else if response.triple_clicked() {
+                    // Select line:
+                    let center = cursor_at_pointer;
+                    let ccursor_range = select_line_at(text.as_str(), center.ccursor);
+                    state.set_cursor_range(Some(CursorRange {
+                        primary: galley.from_ccursor(ccursor_range.primary),
+                        secondary: galley.from_ccursor(ccursor_range.secondary),
+                    }));
+                } else if allow_drag_to_select {
+                    if response.hovered() && ui.input(|i| i.pointer.any_pressed()) {
+                        ui.memory_mut(|mem| mem.request_focus(id));
+                        if ui.input(|i| i.modifiers.shift) {
+                            if let Some(mut cursor_range) = state.cursor_range(&galley) {
+                                cursor_range.primary = cursor_at_pointer;
+                                state.set_cursor_range(Some(cursor_range));
+                            } else {
+                                state.set_cursor_range(Some(CursorRange::one(cursor_at_pointer)));
+                            }
+                        } else {
+                            state.set_cursor_range(Some(CursorRange::one(cursor_at_pointer)));
+                        }
+                    } else if ui.input(|i| i.pointer.any_down())
+                        && response.is_pointer_button_down_on()
+                    {
+                        // drag to select text:
+                        if let Some(mut cursor_range) = state.cursor_range(&galley) {
+                            cursor_range.primary = cursor_at_pointer;
+                            state.set_cursor_range(Some(cursor_range));
+                        }
+                    }
+                }
+            }
+        }
+
+        if interactive && response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Text);
+        }
+
+        let mut cursor_range = None;
+        let prev_cursor_range = state.cursor_range(&galley);
+        if interactive && ui.memory(|mem| mem.has_focus(id)) {
+            ui.memory_mut(|mem| mem.lock_focus(id, lock_focus));
+
+            let default_cursor_range = if cursor_at_end {
+                CursorRange::one(galley.end())
+            } else {
+                CursorRange::default()
+            };
+
+            let (changed, new_cursor_range) = events(
+                ui,
+                &mut state,
+                text,
+                &mut galley,
+                layouter,
+                id,
+                wrap_width,
+                multiline,
+                password,
+                default_cursor_range,
+            );
+
+            if changed {
+                response.mark_changed();
+            }
+            cursor_range = Some(new_cursor_range);
+        }
+
+        let mut text_draw_pos = align
+            .align_size_within_rect(galley.size(), response.rect)
+            .intersect(response.rect) // limit pos to the response rect area
+            .min;
+        let align_offset = response.rect.left() - text_draw_pos.x;
+
+        // Visual clipping for singleline text editor with text larger than width
+        if clip_text && align_offset == 0.0 {
+            let cursor_pos = match (cursor_range, ui.memory(|mem| mem.has_focus(id))) {
+                (Some(cursor_range), true) => galley.pos_from_cursor(&cursor_range.primary).min.x,
+                _ => 0.0,
+            };
+
+            let mut offset_x = state.singleline_offset;
+            let visible_range = offset_x..=offset_x + desired_size.x;
+
+            if !visible_range.contains(&cursor_pos) {
+                if cursor_pos < *visible_range.start() {
+                    offset_x = cursor_pos;
+                } else {
+                    offset_x = cursor_pos - desired_size.x;
+                }
+            }
+
+            offset_x = offset_x
+                .at_most(galley.size().x - desired_size.x)
+                .at_least(0.0);
+
+            state.singleline_offset = offset_x;
+            text_draw_pos -= vec2(offset_x, 0.0);
+        } else {
+            state.singleline_offset = align_offset;
+        }
+
+        let selection_changed = if let (Some(cursor_range), Some(prev_cursor_range)) =
+            (cursor_range, prev_cursor_range)
+        {
+            prev_cursor_range.as_ccursor_range() != cursor_range.as_ccursor_range()
+        } else {
+            false
+        };
+
+        if ui.is_rect_visible(rect) {
+            painter.galley(text_draw_pos, galley.clone());
+
+            if text.as_str().is_empty() && !hint_text.is_empty() {
+                let hint_text_color = ui.visuals().weak_text_color();
+                let galley = if multiline {
+                    hint_text.into_galley(ui, Some(true), desired_size.x, font_id)
+                } else {
+                    hint_text.into_galley(ui, Some(false), f32::INFINITY, font_id)
+                };
+                galley.paint_with_fallback_color(&painter, response.rect.min, hint_text_color);
+            }
+
+            if ui.memory(|mem| mem.has_focus(id)) {
+                if let Some(cursor_range) = state.cursor_range(&galley) {
+                    // We paint the cursor on top of the text, in case
+                    // the text galley has backgrounds (as e.g. `code` snippets in markup do).
+                    paint_cursor_selection(ui, &painter, text_draw_pos, &galley, &cursor_range);
+
+                    if text.is_mutable() {
+                        let cursor_pos = paint_cursor_end(
+                            ui,
+                            row_height,
+                            &painter,
+                            text_draw_pos,
+                            &galley,
+                            &cursor_range.primary,
+                        );
+
+                        let is_fully_visible = ui.clip_rect().contains_rect(rect); // TODO: remove this HACK workaround for https://github.com/emilk/egui/issues/1531
+                        if (response.changed || selection_changed) && !is_fully_visible {
+                            ui.scroll_to_rect(cursor_pos, None); // keep cursor in view
+                        }
+
+                        if interactive {
+                            // eframe web uses `text_cursor_pos` when showing IME,
+                            // so only set it when text is editable and visible!
+                            // But `winit` and `egui_web` differs in how to set the
+                            // position of IME.
+                            if cfg!(target_arch = "wasm32") {
+                                ui.ctx().output_mut(|o| {
+                                    o.text_cursor_pos = Some(cursor_pos.left_top());
+                                });
+                            } else {
+                                ui.ctx().output_mut(|o| {
+                                    o.text_cursor_pos = Some(cursor_pos.left_bottom());
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        state.clone().store(ui.ctx(), id);
+
+        if response.changed {
+            response.widget_info(|| {
+                WidgetInfo::text_edit(
+                    mask_if_password(password, prev_text.as_str()),
+                    mask_if_password(password, text.as_str()),
+                )
+            });
+        } else if selection_changed {
+            let cursor_range = cursor_range.unwrap();
+            let char_range =
+                cursor_range.primary.ccursor.index..=cursor_range.secondary.ccursor.index;
+            let info = WidgetInfo::text_selection_changed(
+                char_range,
+                mask_if_password(password, text.as_str()),
+            );
+            response.output_event(OutputEvent::TextSelectionChanged(info));
+        } else {
+            response.widget_info(|| {
+                WidgetInfo::text_edit(
+                    mask_if_password(password, prev_text.as_str()),
+                    mask_if_password(password, text.as_str()),
+                )
+            });
+        }
+
+        #[cfg(feature = "accesskit")]
+        {
+            let parent_id = ui.ctx().accesskit_node_builder(response.id, |builder| {
+                use accesskit::{TextPosition, TextSelection};
+
+                let parent_id = response.id;
+
+                if let Some(cursor_range) = &cursor_range {
+                    let anchor = &cursor_range.secondary.rcursor;
+                    let focus = &cursor_range.primary.rcursor;
+                    builder.set_text_selection(TextSelection {
+                        anchor: TextPosition {
+                            node: parent_id.with(anchor.row).accesskit_id(),
+                            character_index: anchor.column,
+                        },
+                        focus: TextPosition {
+                            node: parent_id.with(focus.row).accesskit_id(),
+                            character_index: focus.column,
+                        },
+                    });
+                }
+
+                builder.set_default_action_verb(accesskit::DefaultActionVerb::Focus);
+                if self.multiline {
+                    builder.set_multiline();
+                }
+
+                parent_id
+            });
+
+            if let Some(parent_id) = parent_id {
+                // drop ctx lock before further processing
+                use accesskit::{Role, TextDirection};
+
+                ui.ctx().with_accessibility_parent(parent_id, || {
+                    for (i, row) in galley.rows.iter().enumerate() {
+                        let id = parent_id.with(i);
+                        ui.ctx().accesskit_node_builder(id, |builder| {
+                            builder.set_role(Role::InlineTextBox);
+                            let rect = row.rect.translate(text_draw_pos.to_vec2());
+                            builder.set_bounds(accesskit::Rect {
+                                x0: rect.min.x.into(),
+                                y0: rect.min.y.into(),
+                                x1: rect.max.x.into(),
+                                y1: rect.max.y.into(),
+                            });
+                            builder.set_text_direction(TextDirection::LeftToRight);
+                            // TODO(mwcampbell): Set more node fields for the row
+                            // once AccessKit adapters expose text formatting info.
+
+                            let glyph_count = row.glyphs.len();
+                            let mut value = String::new();
+                            value.reserve(glyph_count);
+                            let mut character_lengths = Vec::<u8>::new();
+                            character_lengths.reserve(glyph_count);
+                            let mut character_positions = Vec::<f32>::new();
+                            character_positions.reserve(glyph_count);
+                            let mut character_widths = Vec::<f32>::new();
+                            character_widths.reserve(glyph_count);
+                            let mut word_lengths = Vec::<u8>::new();
+                            let mut was_at_word_end = false;
+                            let mut last_word_start = 0usize;
+
+                            for glyph in &row.glyphs {
+                                let is_word_char = is_word_char(glyph.chr);
+                                if is_word_char && was_at_word_end {
+                                    word_lengths
+                                        .push((character_lengths.len() - last_word_start) as _);
+                                    last_word_start = character_lengths.len();
+                                }
+                                was_at_word_end = !is_word_char;
+                                let old_len = value.len();
+                                value.push(glyph.chr);
+                                character_lengths.push((value.len() - old_len) as _);
+                                character_positions.push(glyph.pos.x - row.rect.min.x);
+                                character_widths.push(glyph.size.x);
+                            }
+
+                            if row.ends_with_newline {
+                                value.push('\n');
+                                character_lengths.push(1);
+                                character_positions.push(row.rect.max.x - row.rect.min.x);
+                                character_widths.push(0.0);
+                            }
+                            word_lengths.push((character_lengths.len() - last_word_start) as _);
+
+                            builder.set_value(value);
+                            builder.set_character_lengths(character_lengths);
+                            builder.set_character_positions(character_positions);
+                            builder.set_character_widths(character_widths);
+                            builder.set_word_lengths(word_lengths);
+                        });
+                    }
+                });
+            }
+        }
+
+        TextEditOutput {
+            response,
+            galley,
+            text_draw_pos,
+            text_clip_rect,
+            state,
+            cursor_range,
+        }
+    }
+
     fn show_content(self, ui: &mut Ui) -> TextEditOutput {
         let TextEdit {
             text,
